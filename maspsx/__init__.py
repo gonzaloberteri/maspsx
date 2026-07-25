@@ -389,11 +389,16 @@ class MaspsxProcessor:
     skip_instructions = 0
     file_num = 1
     line_index = 0
-    # LOCAL PATCH (ygofm-decomp): index of the last input line consumed by a
-    # look-ahead expansion.  `skip_instructions` cannot express this, because it
-    # counts *instructions* and the block being consumed also contains a label
-    # and a `.set` pair, which would otherwise survive into the output.
-    skip_lines_until = -1
+    # LOCAL PATCH (ygofm-decomp): input line indices consumed by a look-ahead
+    # expansion.  `skip_instructions` cannot express this: it counts
+    # *instructions* forward from the current line, where what has to be dropped
+    # here starts several lines later and also contains a label and a `.set`
+    # pair, which would otherwise survive into the output.
+    suppressed_lines: set = set()
+    # Set when a `div $zero` has been expanded and its `mfhi`/`mflo` -- which
+    # belongs to the macro, but which GCC prints as a separate line -- has not
+    # been seen yet.
+    expanded_div_pending = False
 
     def __init__(
         self,
@@ -562,7 +567,8 @@ class MaspsxProcessor:
     def process_lines(self):
         self.is_reorder = True
         self.skip_instructions = 0
-        self.skip_lines_until = -1
+        self.suppressed_lines = set()
+        self.expanded_div_pending = False
         self.file_num = 1
 
         self.bss_entries = {}
@@ -589,7 +595,7 @@ class MaspsxProcessor:
                     in_include_asm_hack = False
                 continue
 
-            if i <= self.skip_lines_until:
+            if i in self.suppressed_lines:
                 res += [f"# {line}  # DEBUG: consumed by div expansion"]
             elif is_instruction(line) and self.skip_instructions > 0:
                 self.skip_instructions -= 1
@@ -634,14 +640,13 @@ class MaspsxProcessor:
 
         return res
 
-    def _match_gcc_division_idiom(self, r_operand: str):
-        """Find the `mfhi`/`mflo` and guard that belong to a `div $zero,s,t`.
+    def _suppress_gcc_zero_guard(self, r_operand: str) -> None:
+        """Drop GCC's own divide-by-zero guard, wherever it landed.
 
         GCC 2.95.2 never emits the assembler's `div`/`rem` macro.  It prints the
         raw instruction with a `$zero` destination -- the field is unused,
         because MIPS division writes hi/lo -- then a separate `mfhi`/`mflo`, and
-        then, unless `-mno-check-zero-division` is given, its own divide-by-zero
-        guard:
+        then, unless `-mno-check-zero-division` is given, its own guard:
 
             div     $0,$2,$16
             mfhi    $2
@@ -653,71 +658,52 @@ class MaspsxProcessor:
             1:
             .set    reorder
 
-        ASPSX's macro instead emits *both* the zero and the INT_MIN/-1 guard and
-        puts the move last.  Reproducing it therefore means consuming all of the
-        above, not just rewriting the `div` line in place -- which is why the
-        previous attempt at `--expand-div` could never work: it assumed the
-        destination register was on the `div` line.
+        ASPSX's macro carries that guard *and* the INT_MIN/-1 one, so GCC's has
+        to go or the zero check is emitted twice.  It is dropped rather than
+        suppressed at the compiler: -mno-check-zero-division also removes the
+        block that keeps `mfhi` next to `div`, and the scheduler then hoists
+        unrelated instructions into the gap, which the original does not do.
 
-        Returns `(move_from, r_dest, last_index)` or None.  `last_index` is the
-        final input line the caller should suppress.
+        The guard is not necessarily adjacent to the division -- the scheduler
+        moves the move and the guard together, several instructions down -- so
+        this scans forward for the three-instruction shape rather than assuming
+        a fixed offset.  It stops at the next division so two in one function
+        cannot steal each other's guard.
         """
-        skippable = ("#nop", ".set\treorder", ".set\tnoreorder",
-                     ".set\tmacro", ".set\tnomacro", "")
-
-        def step(i):
-            """Next line index that carries meaning, or None."""
-            while i < len(self.lines):
-                line = self.lines[i]
-                if line in skippable or line.startswith((".stab", ".loc", ".def")):
-                    i += 1
-                    continue
-                return i
-            return None
-
-        i = step(self.line_index + 1)
-        if i is None:
-            return None
-        m = re.match(r"^(mfhi|mflo)\s+(\$[0-9A-Za-z]+)$", self.lines[i])
-        if m is None:
-            # The move was scheduled away from the division; not our idiom.
-            return None
-        move_from, r_dest = m.group(1), m.group(2)
-        last = i
-
-        # The guard is optional: -mno-check-zero-division suppresses it, and
-        # GCC omits it outright when it can prove the divisor is non-zero.
-        j = step(i + 1)
-        if j is None:
-            return move_from, r_dest, last
-        m = re.match(r"^bne\s+%s,\$(?:0|zero),(\S+)$" % re.escape(r_operand),
-                     self.lines[j])
-        if m is None:
-            return move_from, r_dest, last
-        label = m.group(1)
-        j2 = step(j + 1)
-        if j2 is None or self.lines[j2] != "nop":
-            return move_from, r_dest, last
-        j3 = step(j2 + 1)
-        if j3 is None or not re.match(r"^break\s+7$", self.lines[j3]):
-            return move_from, r_dest, last
-        # `bne ...,1f` is answered by a `1:` label.  Consume it too, so the
-        # output does not carry a label nothing branches to any more.
-        j4 = step(j3 + 1)
-        if j4 is not None and self.lines[j4] == label.rstrip("f") + ":":
-            last = j4
-        else:
-            last = j3
-        return move_from, r_dest, last
+        i = self.line_index + 1
+        guard = re.compile(r"^bne\s+%s,\$(?:0|zero),(\S+)$" % re.escape(r_operand))
+        while i < len(self.lines):
+            line = self.lines[i]
+            if re.match(r"^(div|divu|rem|remu)\s", line):
+                return
+            m = guard.match(line)
+            if m is None:
+                i += 1
+                continue
+            label = m.group(1)
+            if (i + 2 < len(self.lines) and self.lines[i + 1] == "nop"
+                    and re.match(r"^break\s+7$", self.lines[i + 2])):
+                self.suppressed_lines.update({i, i + 1, i + 2})
+                # `bne ...,1f` is answered by a `1:` label.  Take it too, so no
+                # label survives that nothing branches to any more.
+                if (i + 3 < len(self.lines)
+                        and self.lines[i + 3] == label.rstrip("f") + ":"):
+                    self.suppressed_lines.add(i + 3)
+                return
+            i += 1
 
     def _expand_gcc_division(self, line: str, op: str, r_source: str,
                              r_operand: str):
-        """ASPSX's `div`/`rem` macro over GCC's split div + move form."""
-        found = self._match_gcc_division_idiom(r_operand)
-        if found is None:
-            return [line]
-        move_from, r_dest, last_index = found
-        self.skip_lines_until = last_index
+        """ASPSX's `div`/`rem` macro over GCC's split div + move form.
+
+        The guards are emitted where the division is and the `mfhi`/`mflo` is
+        left exactly where GCC put it, which is what ASPSX does: expanding a
+        macro lengthens the instruction stream at that point without moving
+        anything around it.  When the move is adjacent -- the common case -- it
+        ends up after both guards, which is the shape the original binary has.
+        """
+        self._suppress_gcc_zero_guard(r_operand)
+        self.expanded_div_pending = True
 
         idx = self.line_index
         not_zero = f".L_NOT_DIV_BY_ZERO_{idx}"
@@ -744,7 +730,6 @@ class MaspsxProcessor:
                 f"{in_range}:",
             ]
         res += [
-            f"{move_from}\t{r_dest}",
             ".set\tat",
             "# EXPAND_DIV END",
         ]
@@ -756,6 +741,14 @@ class MaspsxProcessor:
         i = self.line_index + 1
         while i < len(self.lines):
             line = self.lines[i]
+            # A line already consumed by an expansion is not in the output, so
+            # look-ahead must not see it either.  Otherwise GCC's `#nop`
+            # placeholder after a `mflo` is judged against the guard that was
+            # removed, rather than against the instruction that now follows --
+            # and a load-delay nop the original has goes missing.
+            if i in self.suppressed_lines:
+                i += 1
+                continue
             if is_instruction(
                 line,
                 ignore_nop=ignore_nop,
@@ -1241,7 +1234,22 @@ class MaspsxProcessor:
 
         elif op in ("mflo", "mfhi"):
             res.append(line)
-            res += self._handle_mflo_mfhi()
+            extra = self._handle_mflo_mfhi()
+            if extra:
+                res += extra
+            elif self.expanded_div_pending:
+                # This move is part of an expanded division macro, so it gets
+                # the macro's trailing load-delay nop -- the same treatment the
+                # non-$zero div branch below applies to its own move.  A move
+                # that merely follows a `mult` does not, and is left alone.
+                r_dest = rest[0].strip()
+                next_instruction = self.get_next_instruction(
+                    skip=0, ignore_nop=True, ignore_set=True, ignore_label=True
+                )
+                res += self._handle_nop_before_next_instruction(
+                    next_instruction, r_dest
+                )
+            self.expanded_div_pending = False
 
         elif op == "break":
             # turn 'break 7' into 'break 0x0,0x7'
