@@ -421,6 +421,10 @@ class MaspsxProcessor:
         self.bss_entries: dict[str, int] = {}
         self.sbss_entries: dict[str, int] = {}
         self.sdata_entries: dict[str, int] = {}
+        # LOCAL PATCH (ygofm-decomp): small `.extern` symbols.  Kept apart from
+        # sbss_entries because that dict is also walked to *emit* .sbss
+        # definitions, and an extern must stay undefined in this object.
+        self.extern_small_entries: dict[str, int] = {}
 
         self.comm_symbols: set[str] = set()
 
@@ -466,6 +470,29 @@ class MaspsxProcessor:
 
             if line.startswith(".extern"):
                 in_sdata = False
+                # LOCAL PATCH (ygofm-decomp): record small externs as small data.
+                #
+                # Upstream only learns which symbols live in the small-data area
+                # from `.sdata` blocks and `.comm`/`.lcomm`, i.e. objects defined
+                # in this translation unit.  Decompiled code references the
+                # game's globals as `extern`, and cc1 emits `.extern sym, size`
+                # for those -- so they were never recognised as small, and
+                # `_uses_gp()` returned False for them.  The consequence is a
+                # missing load-delay `nop`: a `lhu` through a gp symbol followed
+                # by a dependent op emitted `#nop` instead of a real one, leaving
+                # every such function one word short per pair.  gas -G8 then
+                # does gp-relative the access anyway, so the two disagreed.
+                #
+                # `.extern sym, size` carries the size, which is exactly the test
+                # gas itself applies, so honouring it here matches gas.
+                try:
+                    _, var = line.split(None, 1)
+                    symbol, size_str, *_ = var.split(",")
+                    size = int(size_str.strip())
+                except (ValueError, IndexError):
+                    continue
+                if size <= self.sdata_limit:
+                    self.extern_small_entries[symbol.strip()] = size
                 continue
 
             if line.startswith(".comm") or line.startswith(".lcomm"):
@@ -527,6 +554,7 @@ class MaspsxProcessor:
         self.bss_entries = {}
         self.sbss_entries = {}
         self.sdata_entries = {}
+        self.extern_small_entries = {}
 
         self.preprocess_lines()
 
@@ -634,6 +662,7 @@ class MaspsxProcessor:
 
                 if gp_allowed and (
                     symbol in self.sbss_entries or symbol in self.sdata_entries
+                    or symbol in self.extern_small_entries
                 ):
                     return True
 
