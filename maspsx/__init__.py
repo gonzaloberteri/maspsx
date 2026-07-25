@@ -205,13 +205,21 @@ def parse_load_or_store(rest: str):
     return (r_source, r_dest, operand, is_addend, needs_expanding)
 
 
-def div_needs_expanding(line: str) -> bool:
+def div_needs_expanding(line: str, allow_zero_dest: bool = False) -> bool:
     inst, *rest = line.split()
     if not (inst.startswith("div") or inst.startswith("rem")):
         return False
 
     r_dest, *_ = rest[0].split(",")
-    return r_dest not in ("$zero", "$0")
+    # LOCAL PATCH (ygofm-decomp): GCC 2.95.2 as shipped in Psy-Q 4.6 always
+    # prints division as `div $0,%1,%2` -- the destination field is unused,
+    # because MIPS div writes hi/lo. Refusing a $zero destination therefore made
+    # --expand-div a silent no-op for every function this compiler produces, so
+    # ASPSX's two-guard macro was never reproduced. Gated on the flag so default
+    # behaviour is unchanged for callers that do not ask for expansion.
+    if r_dest in ("$zero", "$0"):
+        return allow_zero_dest
+    return True
 
 
 def expand_load_immediate(line: str) -> List[str]:
@@ -731,7 +739,7 @@ class MaspsxProcessor:
                 if inst == next_instruction:
                     res.append("nop")
                     res.append("nop")
-                    if div_needs_expanding(inst):
+                    if div_needs_expanding(inst, self.expand_div):
                         res.append("# DEBUG: div needs expanding")
                         skip -= 1
                     else:
@@ -836,7 +844,7 @@ class MaspsxProcessor:
 
                 elif inst == next_next_instruction:
                     # reached mult/div/rem
-                    if div_needs_expanding(inst):
+                    if div_needs_expanding(inst, self.expand_div):
                         res.append("# DEBUG: div needs expanding")
                         skip -= 1
                     else:
